@@ -152,17 +152,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     else:
         lf = lambda x: (1 - x / epochs) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
 
-    # def lf(x):  # saw
-    #     return (1 - (x % 30) / 30) * (1 - x / epochs) * (1.0 - hyp['lrf']) + hyp['lrf']
-    #
-    # def lf(x):  # triangle start at min
-    #     return 2 * abs(x / 30 - math.floor(x / 30 + 1 / 2)) * (1 - x / epochs) * (1.0 - hyp['lrf']) + hyp['lrf']
-    #
-    # def lf(x):  # triangle start at max
-    #     return 2 * abs(x / 32 + .5 - math.floor(x / 32 + 1)) * (1 - x / epochs) * (1.0 - hyp['lrf']) + hyp['lrf']
-
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
-    # from utils.plots import plot_lr_scheduler; plot_lr_scheduler(optimizer, scheduler, epochs)
 
     # EMA
     ema = ModelEMA(model) if RANK in {-1, 0} else None
@@ -222,8 +212,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                        prefix=colorstr('val: '))[0]
 
         if not resume:
-            # if not opt.noautoanchor:
-            #     check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)  # run AutoAnchor
             model.half().float()  # pre-reduce anchor precision
 
         callbacks.run('on_pretrain_routine_end', labels, names)
@@ -233,10 +221,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         model = smart_DDP(model)
 
     # Model attributes
-    nl = de_parallel(model).model[-1].nl  # number of detection layers (to scale hyps)
-    #hyp['box'] *= 3 / nl  # scale to layers
-    #hyp['cls'] *= nc / 80 * 3 / nl  # scale to classes and layers
-    #hyp['obj'] *= (imgsz / 640) ** 2 * 3 / nl  # scale to image size and layers
+    nl = de_parallel(model).model[-1].nl  # number of detection layers
     hyp['label_smoothing'] = opt.label_smoothing
     model.nc = nc  # attach number of classes to model
     model.hyp = hyp  # attach hyperparameters to model
@@ -247,7 +232,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     t0 = time.time()
     nb = len(train_loader)  # number of batches
     nw = max(round(hyp['warmup_epochs'] * nb), 100)  # number of warmup iterations, max(3 epochs, 100 iterations)
-    # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
     last_opt_step = -1
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
@@ -273,10 +257,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             LOGGER.info("Closing dataloader mosaic")
             dataset.mosaic = False
 
-        # Update mosaic border (optional)
-        # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
-        # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
-
         mloss = torch.zeros(3, device=device)  # mean losses
         if RANK != -1:
             train_loader.sampler.set_epoch(epoch)
@@ -293,7 +273,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             # Warmup
             if ni <= nw:
                 xi = [0, nw]  # x interp
-                # compute_loss.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
                 accumulate = max(1, np.interp(ni, xi, [1, nbs / batch_size]).round())
                 for j, x in enumerate(optimizer.param_groups):
                     # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
@@ -321,10 +300,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             # Backward
             scaler.scale(loss).backward()
 
-            # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
+            # Optimize
             if ni - last_opt_step >= accumulate:
-                scaler.unscale_(optimizer)  # unscale gradients
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
                 scaler.step(optimizer)  # optimizer.step
                 scaler.update()
                 optimizer.zero_grad()
@@ -437,57 +414,17 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
 def parse_opt(known=False):
     parser = argparse.ArgumentParser()
-    # parser.add_argument('--weights', type=str, default=ROOT / 'yolo.pt', help='initial weights path')
-    # parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
-    parser.add_argument('--weights', type=str, default='', help='initial weights path')
-    parser.add_argument('--cfg', type=str, default='yolo.yaml', help='model.yaml path')
-    parser.add_argument('--data', type=str, default=ROOT / 'data/coco.yaml', help='dataset.yaml path')
-    parser.add_argument('--hyp', type=str, default=ROOT / 'data/hyps/hyp.scratch-high.yaml', help='hyperparameters path')
-    parser.add_argument('--epochs', type=int, default=100, help='total training epochs')
-    parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs, -1 for autobatch')
-    parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='train, val image size (pixels)')
-    parser.add_argument('--rect', action='store_true', help='rectangular training')
-    parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
-    parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
-    parser.add_argument('--noval', action='store_true', help='only validate final epoch')
-    parser.add_argument('--noautoanchor', action='store_true', help='disable AutoAnchor')
-    parser.add_argument('--noplots', action='store_true', help='save no plot files')
-    parser.add_argument('--evolve', type=int, nargs='?', const=300, help='evolve hyperparameters for x generations')
-    parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
-    parser.add_argument('--cache', type=str, nargs='?', const='ram', help='image --cache ram/disk')
-    parser.add_argument('--image-weights', action='store_true', help='use weighted image selection for training')
-    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
-    parser.add_argument('--multi-scale', action='store_true', help='vary img-size +/- 50%%')
-    parser.add_argument('--single-cls', action='store_true', help='train multi-class data as single-class')
-    parser.add_argument('--optimizer', type=str, choices=['SGD', 'Adam', 'AdamW', 'LION'], default='SGD', help='optimizer')
-    parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
-    parser.add_argument('--workers', type=int, default=8, help='max dataloader workers (per RANK in DDP mode)')
-    parser.add_argument('--project', default=ROOT / 'runs/train', help='save to project/name')
-    parser.add_argument('--name', default='exp', help='save to project/name')
-    parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
-    parser.add_argument('--quad', action='store_true', help='quad dataloader')
-    parser.add_argument('--cos-lr', action='store_true', help='cosine LR scheduler')
-    parser.add_argument('--flat-cos-lr', action='store_true', help='flat cosine LR scheduler')
-    parser.add_argument('--fixed-lr', action='store_true', help='fixed LR scheduler')
-    parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing epsilon')
-    parser.add_argument('--patience', type=int, default=100, help='EarlyStopping patience (epochs without improvement)')
-    parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone=10, first3=0 1 2')
-    parser.add_argument('--save-period', type=int, default=-1, help='Save checkpoint every x epochs (disabled if < 1)')
-    parser.add_argument('--seed', type=int, default=0, help='Global training seed')
-    parser.add_argument('--local_rank', type=int, default=-1, help='Automatic DDP Multi-GPU argument, do not modify')
-    parser.add_argument('--min-items', type=int, default=0, help='Experimental')
-    parser.add_argument('--close-mosaic', type=int, default=0, help='Experimental')
-
-    # Logger arguments
-    parser.add_argument('--entity', default=None, help='Entity')
-    parser.add_argument('--upload_dataset', nargs='?', const=True, default=False, help='Upload data, "val" option')
-    parser.add_argument('--bbox_interval', type=int, default=-1, help='Set bounding-box image logging interval')
-    parser.add_argument('--artifact_alias', type=str, default='latest', help='Version of dataset artifact to use')
-
+    parser.add_argument('--config', type=str, default='config.yaml', help='path to the configuration file')
     return parser.parse_known_args()[0] if known else parser.parse_args()
 
 
 def main(opt, callbacks=Callbacks()):
+    # Load configuration from YAML file
+    with open(opt.config) as f:
+        config = yaml.safe_load(f)
+        for k, v in config.items():
+            setattr(opt, k, v)
+
     # Checks
     if RANK in {-1, 0}:
         print_args(vars(opt))
@@ -570,7 +507,6 @@ def main(opt, callbacks=Callbacks()):
             'mosaic': (1, 0.0, 1.0),  # image mixup (probability)
             'mixup': (1, 0.0, 1.0),  # image mixup (probability)
             'copy_paste': (1, 0.0, 1.0)}  # segment copy-paste (probability)
-
         with open(opt.hyp, errors='ignore') as f:
             hyp = yaml.safe_load(f)  # load hyps dict
             if 'anchors' not in hyp:  # anchors commented in hyp.yaml
@@ -578,7 +514,6 @@ def main(opt, callbacks=Callbacks()):
         if opt.noautoanchor:
             del hyp['anchors'], meta['anchors']
         opt.noval, opt.nosave, save_dir = True, True, Path(opt.save_dir)  # only val/save final epoch
-        # ei = [isinstance(x, (int, float)) for x in hyp.values()]  # evolvable indices
         evolve_yaml, evolve_csv = save_dir / 'hyp_evolve.yaml', save_dir / 'evolve.csv'
         if opt.bucket:
             os.system(f'gsutil cp gs://{opt.bucket}/evolve.csv {evolve_csv}')  # download evolve.csv if exists
@@ -592,7 +527,6 @@ def main(opt, callbacks=Callbacks()):
                 x = x[np.argsort(-fitness(x))][:n]  # top n mutations
                 w = fitness(x) - fitness(x).min() + 1E-6  # weights (sum > 0)
                 if parent == 'single' or len(x) == 1:
-                    # x = x[random.randint(0, n - 1)]  # random selection
                     x = x[random.choices(range(n), weights=w)[0]]  # weighted selection
                 elif parent == 'weighted':
                     x = (x * w.reshape(n, 1)).sum(0) / w.sum()  # weighted combination
@@ -618,6 +552,7 @@ def main(opt, callbacks=Callbacks()):
             # Train mutation
             results = train(hyp.copy(), opt, device, callbacks)
             callbacks = Callbacks()
+
             # Write mutation results
             keys = ('metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95', 'val/box_loss',
                     'val/obj_loss', 'val/cls_loss')
@@ -631,7 +566,7 @@ def main(opt, callbacks=Callbacks()):
 
 
 def run(**kwargs):
-    # Usage: import train; train.run(data='coco128.yaml', imgsz=320, weights='yolo.pt')
+    # Usage: import train; train.run(data='coco128.yaml', imgsz=320, weights='yolov3.pt')
     opt = parse_opt(True)
     for k, v in kwargs.items():
         setattr(opt, k, v)
